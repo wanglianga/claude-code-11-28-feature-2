@@ -7,6 +7,7 @@
 - 主体合并不自动发生：同名只生成候选，统一社会标识不一致禁止归并，合并需人工确认且带冲突检查。
 """
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -32,6 +33,8 @@ REV_ROSTER_DOC = "roster_document"
 REV_ROSTER_ROW = "roster_row"
 REV_MERGE = "subject_merge"
 REV_CONTROL = "manual_control"
+REV_PROFIT = "profit_statement"
+REV_RESOLUTION = "dividend_resolution"
 
 # 修订状态
 ST_DRAFT = "draft"          # 已导入待审核
@@ -293,4 +296,328 @@ class ImportEvent(Base):
     succeeded_rows: Mapped[int] = mapped_column(Integer, default=0)
     failed_rows: Mapped[int] = mapped_column(Integer, default=0)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# =====================================================================
+# 利润来源穿透与跨期对账（财务事实层）
+#
+# 纪律（对应需求）：
+# - 利润表按会计期间、决议按记录日、应收按确认日、回单按到账日分别建模，
+#   绝不把"同月发生"当作同一会计事实。
+# - 来源分配只采用决议记录日的可确认股权快照；缺失时列"权属待证"，不借用最近一期。
+# - 交叉持股保留路径贡献与残差，循环部分不重复累加。
+# - 回单一对多且摘要无法区分时保持候选并从已核验到账中排除。
+# - 重述只在跨期桥接中生成差异，不回写已封存审计快照。
+# - 无获批汇率来源时只发布原币金额与缺失汇率提示，不按市场汇率自行换算。
+# - 不执行分红批准、现金预留、银行付款、退款或余额扣还。
+# =====================================================================
+
+# 利润表 / 决议 / 应收 状态
+FIN_DRAFT = "draft"
+FIN_APPROVED = "approved"
+FIN_SUPERSEDED = "superseded"   # 利润表被更正/重述后保留原值
+FIN_RESTATED = "restated"       # 重述后的新利润表
+
+# 股权快照状态
+SNAP_CONFIRMABLE = "confirmable"   # 记录日可确认的时点快照
+SNAP_UNCONFIRMED = "unconfirmed"   # 仅登记、不可用于来源分配
+
+# 回单匹配结论
+MATCH_VERIFIED = "verified"           # 唯一匹配，计入已核验到账
+MATCH_ONE_TO_MANY = "one_to_many"     # 一对多等额冲突，保持候选、排除出已核验
+MATCH_SPLIT = "split"                 # 一张应收由多张回单拆分，理由记为事实
+MATCH_AGGREGATED = "aggregated"       # 一张回单汇聚多张应收，理由记为事实
+MATCH_CANDIDATE = "candidate"         # 弱证据候选，不核验
+MATCH_EXCLUDED = "excluded"           # 明确排除
+
+# 跨期桥接层
+BR_DECLARED = "declared_receivable"     # 已声明应收
+BR_VERIFIED = "verified_receipt"        # 可核验到账
+BR_FX = "fx_difference"                 # 汇率差异
+BR_RESTATE = "restatement_impact"       # 重述影响
+BR_UNALLOC = "unallocatable"            # 无法归属
+
+# 对账运行状态
+RECON_DRAFT = "draft"
+RECON_PUBLISHED = "published"
+RECON_SEALED = "sealed"                 # 审计快照已封存，只读
+
+
+class ProfitStatement(Base):
+    """某公司某会计期间的利润表（可被重述/更正，但原表不删除）。"""
+    __tablename__ = "profit_statements"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)
+    source_ref: Mapped[str] = mapped_column(String(128), index=True)
+    content_fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    period_code: Mapped[str] = mapped_column(String(32), index=True)   # 如 2025-FY / 2026-H1
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    status: Mapped[str] = mapped_column(String(16), default=FIN_DRAFT, index=True)
+    # 重述指针：新表通过该字段指向被重述的旧表；旧表保留原值，标记 superseded
+    restates_statement_id: Mapped[int | None] = mapped_column(
+        ForeignKey("profit_statements.id"), nullable=True)
+    staging: Mapped[str] = mapped_column(String(16), default="original")  # original / restated
+    provenance: Mapped[str] = mapped_column(Text)
+    revision_id: Mapped[int | None] = mapped_column(ForeignKey("revisions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    lines: Mapped[list["ProfitLine"]] = relationship(
+        back_populates="statement", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("source_ref", "content_fingerprint", name="uq_profit_source_fp"),
+    )
+
+
+class ProfitLine(Base):
+    """利润表中的一行：经营或投资收益行；投资分红行可指向付款公司以便穿透。"""
+    __tablename__ = "profit_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    statement_id: Mapped[int] = mapped_column(ForeignKey("profit_statements.id"), index=True)
+    line_no: Mapped[int] = mapped_column(Integer)
+    line_category: Mapped[str] = mapped_column(String(24))  # operating / dividend_income / other
+    label: Mapped[str] = mapped_column(String(256))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    # 分红收益行的付款公司：用于向下穿透到该公司的利润来源
+    payer_company_subject_id: Mapped[int | None] = mapped_column(
+        ForeignKey("subjects.id"), nullable=True)
+    share_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provenance: Mapped[str] = mapped_column(Text)
+
+    statement: Mapped[ProfitStatement] = relationship(back_populates="lines")
+
+    __table_args__ = (UniqueConstraint("statement_id", "line_no", name="uq_profit_line_no"),)
+
+
+class EquitySnapshot(Base):
+    """时点股权快照：来源分配只允许采用记录日可确认的快照。"""
+    __tablename__ = "equity_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, index=True)  # 记录日/时点
+    source_ref: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(16), default=SNAP_CONFIRMABLE, index=True)
+    analysis_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("analysis_runs.id"), nullable=True)
+    provenance: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    holdings: Mapped[list["EquitySnapshotHolding"]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("company_subject_id", "snapshot_date", "source_ref",
+                         name="uq_snapshot_company_date_ref"),
+    )
+
+
+class EquitySnapshotHolding(Base):
+    """快照中的一条持股：按股份类别记录股份数与占比。"""
+    __tablename__ = "equity_snapshot_holdings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("equity_snapshots.id"), index=True)
+    holder_subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
+    holder_label: Mapped[str] = mapped_column(String(256))
+    share_class: Mapped[str] = mapped_column(String(32), index=True)
+    shares: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    class_total_shares: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    ratio: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+
+    snapshot: Mapped[EquitySnapshot] = relationship(back_populates="holdings")
+
+    __table_args__ = (Index("ix_snapshot_holding_holder", "holder_subject_id"),)
+
+
+class DividendResolution(Base):
+    """董事会分红决议：记录日用于确定有权股权，与会计期间、到账日相互独立。"""
+    __tablename__ = "dividend_resolutions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)
+    resolution_no: Mapped[str] = mapped_column(String(64), index=True)
+    declaration_date: Mapped[date] = mapped_column(Date)   # 决议记录日
+    record_date: Mapped[date] = mapped_column(Date, index=True)  # 股权登记日
+    share_class: Mapped[str] = mapped_column(String(32))
+    total_declared_amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    # 决议所分配的利润来自哪个会计期间（与记录日、确认日、到账日无关）
+    funding_period_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default=FIN_DRAFT, index=True)
+    provenance: Mapped[str] = mapped_column(Text)
+    revision_id: Mapped[int | None] = mapped_column(ForeignKey("revisions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    lines: Mapped[list["ResolutionLine"]] = relationship(
+        back_populates="resolution", cascade="all, delete-orphan")
+
+
+class ResolutionLine(Base):
+    """决议中分配给某上层持有人的一行；应收即由此产生。"""
+    __tablename__ = "resolution_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    resolution_id: Mapped[int] = mapped_column(ForeignKey("dividend_resolutions.id"), index=True)
+    line_no: Mapped[int] = mapped_column(Integer)
+    holder_subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
+    holder_label: Mapped[str] = mapped_column(String(256))
+    share_class: Mapped[str] = mapped_column(String(32))
+    declared_amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    provenance: Mapped[str] = mapped_column(Text)
+
+    resolution: Mapped[DividendResolution] = relationship(back_populates="lines")
+
+    __table_args__ = (UniqueConstraint("resolution_id", "line_no", name="uq_resolution_line_no"),)
+
+
+class ReceivableNotice(Base):
+    """子公司应收通知：按收款主体与应收确认日记录。"""
+    __tablename__ = "receivable_notices"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    issuer_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)   # 出具通知的子公司
+    collecting_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)  # 收款主体/上层公司
+    receivable_no: Mapped[str] = mapped_column(String(64), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    confirmed_date: Mapped[date] = mapped_column(Date, index=True)   # 应收确认日
+    resolution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dividend_resolutions.id"), nullable=True)
+    resolution_line_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resolution_lines.id"), nullable=True)
+    source_ref: Mapped[str] = mapped_column(String(128), index=True)
+    provenance: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default=FIN_APPROVED, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BankReceipt(Base):
+    """银行回单：按到账日期记录；外部回单号、币种、方向、付款主体、摘要用于匹配。"""
+    __tablename__ = "bank_receipts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    receipt_no: Mapped[str] = mapped_column(String(64), index=True)   # 外部回单号
+    collecting_subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), index=True)
+    payer_subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
+    payer_label: Mapped[str] = mapped_column(String(256))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(String(8))
+    direction: Mapped[str] = mapped_column(String(8), default="inflow")  # 仅入账回单可核验应收
+    value_date: Mapped[date] = mapped_column(Date, index=True)           # 到账日期
+    memo: Mapped[str] = mapped_column(Text, default="")
+    source_ref: Mapped[str] = mapped_column(String(128), index=True)
+    provenance: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FxRate(Base):
+    """获批汇率来源：只有 approved 且未作废的汇率可用于换算。"""
+    __tablename__ = "fx_rates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    from_currency: Mapped[str] = mapped_column(String(8), index=True)
+    to_currency: Mapped[str] = mapped_column(String(8))
+    rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_ref: Mapped[str] = mapped_column(String(128), index=True)
+    provenance: Mapped[str] = mapped_column(Text)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("from_currency", "to_currency", "source_ref", name="uq_fx_ref"),
+    )
+
+
+class ReconciliationRun(Base):
+    """一次跨期对账运行：在分析日编译来源链、匹配回单、分层桥接。"""
+    __tablename__ = "reconciliation_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    as_of_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(16), default=RECON_DRAFT, index=True)
+    diagnostics: Mapped[str] = mapped_column(Text, default="{}")
+    created_by: Mapped[str] = mapped_column(String(64), default="analyst")
+    published_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    chains: Mapped[list["SourceChain"]] = relationship(cascade="all, delete-orphan")
+    matches: Mapped[list["ReceiptMatch"]] = relationship(cascade="all, delete-orphan")
+    bridges: Mapped[list["BridgeLayer"]] = relationship(cascade="all, delete-orphan")
+
+
+class SourceChain(Base):
+    """来源链：从应收金额经决议行、股权快照、利润表行到经营公司；含残差。"""
+    __tablename__ = "source_chains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_runs.id"), index=True)
+    receivable_id: Mapped[int] = mapped_column(ForeignKey("receivable_notices.id"), index=True)
+    entry_kind: Mapped[str] = mapped_column(String(24))  # operating_line / cycle_residual / title_pending / unallocatable
+    path_json: Mapped[str] = mapped_column(Text, default="[]")
+    terminal_company_subject_id: Mapped[int | None] = mapped_column(
+        ForeignKey("subjects.id"), nullable=True)
+    terminal_statement_id: Mapped[int | None] = mapped_column(
+        ForeignKey("profit_statements.id"), nullable=True)
+    terminal_line_id: Mapped[int | None] = mapped_column(
+        ForeignKey("profit_lines.id"), nullable=True)
+    path_weight: Mapped[Decimal] = mapped_column(Numeric(18, 10))
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))       # 该链贡献金额（原币）
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ReceiptMatch(Base):
+    """回单与应收的匹配：一对一、拆分、汇聚或一对多冲突均记录规则与理由。"""
+    __tablename__ = "receipt_matches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_runs.id"), index=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("bank_receipts.id"), index=True)
+    receivable_id: Mapped[int | None] = mapped_column(
+        ForeignKey("receivable_notices.id"), nullable=True)
+    rule: Mapped[str] = mapped_column(String(32))  # external_ref / amount_payer / memo / split / aggregate / near
+    status: Mapped[str] = mapped_column(String(16), index=True)  # verified / one_to_many / split / aggregated / candidate
+    matched_amount: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(Text)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class BridgeLayer(Base):
+    """跨期桥接：已声明应收 / 可核验到账 / 汇率差异 / 重述影响 / 无法归属 分层发布。"""
+    __tablename__ = "bridge_layers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_runs.id"), index=True)
+    receivable_id: Mapped[int | None] = mapped_column(
+        ForeignKey("receivable_notices.id"), nullable=True)
+    layer: Mapped[str] = mapped_column(String(32), index=True)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    reporting_amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    reporting_currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    fx_status: Mapped[str | None] = mapped_column(String(24), nullable=True)  # applied / missing
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class AuditSnapshot(Base):
+    """审计快照：按截止日封存利润来源、股权版本、决议资料与匹配结果，只读。"""
+    __tablename__ = "audit_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_runs.id"), unique=True)
+    as_of_date: Mapped[date] = mapped_column(Date, index=True)
+    seal_hash: Mapped[str] = mapped_column(String(128), index=True)
+    frozen_json: Mapped[str] = mapped_column(Text)   # 封存内容全文，重述不回写
+    created_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

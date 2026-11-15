@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .db import Base, engine
-from .routers import admin, analysis, auth, review, rosters, subjects
+from .routers import admin, analysis, auth, review, rosters, subjects, finance
 
 # 确保模型被导入以便 create_all 注册
 from . import models  # noqa: F401
@@ -49,6 +49,7 @@ app.include_router(subjects.router)
 app.include_router(rosters.router)
 app.include_router(review.router)
 app.include_router(analysis.router)
+app.include_router(finance.router)
 app.include_router(admin.router)
 
 

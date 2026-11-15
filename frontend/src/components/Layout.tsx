@@ -4,6 +4,8 @@ import { useAuth } from '../auth'
 export default function Layout() {
   const { username, role, logout } = useAuth()
   const tabs = [
+    { to: '/profit-trace', label: '利润穿透对账' },
+    { to: '/finance-ledger', label: '财务事实资料' },
     { to: '/analysis', label: '股权分析' },
     { to: '/rosters', label: '名册导入' },
     { to: '/subjects', label: '主体与匹配' },

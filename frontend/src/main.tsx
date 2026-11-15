@@ -8,6 +8,8 @@ import Subjects from './pages/Subjects'
 import Rosters from './pages/Rosters'
 import Review from './pages/Review'
 import Analysis from './pages/Analysis'
+import ProfitTrace from './pages/ProfitTrace'
+import FinanceLedger from './pages/FinanceLedger'
 import './styles.css'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -26,11 +28,13 @@ const router = createBrowserRouter([
       </RequireAuth>
     ),
     children: [
-      { index: true, element: <Navigate to="/analysis" replace /> },
+      { index: true, element: <Navigate to="/profit-trace" replace /> },
       { path: 'subjects', element: <Subjects /> },
       { path: 'rosters', element: <Rosters /> },
       { path: 'review', element: <Review /> },
       { path: 'analysis', element: <Analysis /> },
+      { path: 'profit-trace', element: <ProfitTrace /> },
+      { path: 'finance-ledger', element: <FinanceLedger /> },
     ],
   },
 ])

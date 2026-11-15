@@ -281,4 +281,9 @@ async def seed_all(db: AsyncSession, user: str = "admin") -> dict:
             approved += 1
     summary["auto_approved"] = approved
     await db.commit()
+
+    # 财务事实层验收样本（利润来源穿透 / 跨期对账 / 重述 / 汇率缺失 / 权属待证）
+    from .seed_finance import seed_finance
+    summary["finance"] = await seed_finance(db, user)
+    await db.commit()
     return summary
